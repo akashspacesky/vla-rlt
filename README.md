@@ -46,13 +46,19 @@ Achieved with **just 2 hours of on-robot training**.
 ## Quickstart
 
 ```bash
+# 0. Install uv (fast Python package manager)
+curl -Ls https://astral.sh/uv/install.sh | sh
+
 # 1. Install GR00T N1
 git clone https://github.com/NVIDIA/Isaac-GR00T
-cd Isaac-GR00T && pip install -e . && cd ..
+cd Isaac-GR00T && uv pip install -e . && cd ..
 
 # 2. Install groot-rlt
 git clone https://github.com/akashspacesky/groot-rlt
-cd groot-rlt && pip install -e ".[dev]"
+cd groot-rlt
+uv venv .venv --python 3.10
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 
 # 3. Validate shapes (no GPU / GR00T needed)
 python scripts/pretrain_rlt.py --dry_run --mock

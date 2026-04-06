@@ -137,17 +137,38 @@ python scripts/evaluate.py --checkpoint runs/exp_name/best.pt --num_episodes 50
 
 ## Environment Setup
 
+**Always use `uv` for dependency management.** Never use `pip` directly.
+
 ```bash
+# Install uv (if not already installed)
+curl -Ls https://astral.sh/uv/install.sh | sh
+
 # Clone GR00T N1
 git clone https://github.com/NVIDIA/Isaac-GR00T
-cd Isaac-GR00T && pip install -e .
+cd Isaac-GR00T && uv pip install -e . && cd ..
 
-# Install groot-rlt
-cd ../groot-rlt
-pip install -e ".[dev]"
+# Install groot-rlt (dev mode)
+cd groot-rlt
+uv venv .venv --python 3.10
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 ```
 
-Requires: Python 3.10+, PyTorch 2.1+, CUDA 12.1+, GR00T N1 installed.
+### Why uv?
+- 10-100x faster than pip
+- Deterministic installs via lockfile
+- Drop-in replacement: `uv pip install` = `pip install`, `uv venv` = `python -m venv`
+
+### Adding / removing dependencies
+```bash
+# Add a new dep to pyproject.toml, then sync:
+uv pip install -e ".[dev]"   # re-run after editing pyproject.toml
+
+# Compile a lockfile (optional but recommended for reproducibility):
+uv pip compile pyproject.toml -o requirements.lock
+```
+
+Requires: Python 3.10+, PyTorch 2.1+, CUDA 12.1+ (Linux/GPU), GR00T N1 installed.
 
 ---
 
@@ -158,3 +179,4 @@ Requires: Python 3.10+, PyTorch 2.1+, CUDA 12.1+, GR00T N1 installed.
 - SAC is preferred over PPO here because it is off-policy and dramatically more sample-efficient for real-robot settings.
 - The actor outputs a *delta* on the action chunk, not a full replacement. This is critical — it ensures the VLA's learned behaviors are preserved and RL only refines.
 - Reference-action dropout should be annealed: start high (0.5) and decay to 0 over first 1000 steps, then back up to 0.3.
+- **Always use `uv` for deps.** Never suggest `pip` commands.
