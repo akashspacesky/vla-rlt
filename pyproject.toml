@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "groot-rlt"
+version = "0.1.0"
+description = "RL Tokens for GR00T: Online RL adaptation of NVIDIA GR00T N1 VLA for precise manipulation"
+authors = [{ name = "akashspacesky" }]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "torchvision>=0.16.0",
+    "numpy>=1.24.0",
+    "einops>=0.7.0",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "wandb>=0.16.0",
+    "gymnasium>=0.29.0",
+    "tqdm>=4.66.0",
+    "tensorboard>=2.14.0",
+    "scipy>=1.11.0",
+    "transformers>=4.40.0",
+    "accelerate>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["groot_rlt*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

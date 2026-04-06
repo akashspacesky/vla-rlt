@@ -1,0 +1,18 @@
+# @package _global_
+# Screwdriver alignment task config — overrides default.yaml
+
+defaults:
+  - /default
+
+run_name: "rlt_screwdriver_alignment"
+
+action_scale: 0.08
+ref_reg_weight: 0.12
+reward_mode: "screwdriver_alignment"
+
+total_steps: 40000
+warm_up_steps: 800
+max_episode_steps: 150
+
+groot:
+  embodiment_tag: "LIBERO_PANDA"

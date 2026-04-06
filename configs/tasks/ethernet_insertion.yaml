@@ -1,0 +1,25 @@
+# @package _global_
+# Ethernet insertion task config — overrides default.yaml
+
+defaults:
+  - /default
+
+run_name: "rlt_ethernet_insertion"
+
+# Precision task: tighter delta scale, stronger regularization
+action_scale: 0.05        # Ethernet needs sub-mm precision
+ref_reg_weight: 0.15      # Keep closer to VLA during early training
+
+# Denser updates since task is short-horizon
+updates_per_step: 300
+chunk_size: 8             # Shorter chunk for fine control
+
+reward_mode: "ethernet_insertion"
+
+# Task-specific episode budget
+total_steps: 30000
+warm_up_steps: 500
+max_episode_steps: 100
+
+groot:
+  embodiment_tag: "LIBERO_PANDA"
