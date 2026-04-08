@@ -1,0 +1,1 @@
+"""\nrlt: RL Tokens for open-source VLAs.\n\nExtends any VLA with online RL tokens for precise robot manipulation.\nDefault backend: SmolVLA (450M, Apple Silicon / MPS native, SO-101 trained).\n"""\n\n__version__ = "0.2.0"\n

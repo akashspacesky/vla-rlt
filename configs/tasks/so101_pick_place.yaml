@@ -1,0 +1,1 @@
+# @package _global_\n# SO-101 pick-and-place\n\ndefaults:\n  - /default\n\nrun_name: \"rlt_so101_pick_place\"\nreward_mode: \"so101_pick_place\"\n\naction_scale: 0.08\nref_reg_weight: 0.12\ntotal_steps: 15000\nwarm_up_steps: 300\nmax_episode_steps: 100\n\nvla:\n  backend: \"smolvla\"\n  model_id: \"lerobot/smolvla_base\"\n
