@@ -1,11 +1,18 @@
-# groot-rlt
+# vla-rlt
 
 ## Project Overview
 
-**groot-rlt** implements Physical Intelligence's RL Token (RLT) idea on NVIDIA's GR00T N1 open-source VLA. The core thesis: pre-trained VLAs are good at general manipulation but lack the precision needed for tight-tolerance tasks (ethernet insertion, screwdriver alignment, zip-tie fastening). RLT adds a compact bottleneck representation extracted from the VLA's internal embeddings, then trains a small actor-critic on that token using online RL — achieving ~3x speedup on precision stages with just 15 minutes of real-world data.
+**vla-rlt** implements Physical Intelligence's RL Token (RLT) approach on open-source VLAs for online learning from experience. The architecture is **VLA-agnostic** — swap the backend by changing one config line.
 
-**Paper**: [Physical Intelligence RLT](https://www.pi.website/research/rlt)  
-**Base model**: [NVIDIA Isaac GR00T N1](https://github.com/NVIDIA/Isaac-GR00T)
+**Default VLA**: SmolVLA (450M, HuggingFace / LeRobot)  
+**Target hardware**: SO-101 robot arm + M2 MacBook Air 8GB (MPS)  
+**Paper**: [Physical Intelligence RLT](https://www.pi.website/research/rlt)
+
+### Why SmolVLA?
+- 450M params — fits comfortably in 8GB unified memory
+- MPS-native: runs on Apple Silicon without CUDA
+- Trained on SO-100/SO-101 data (exact target hardware)
+- LeRobot ecosystem: data, robot drivers, all in one place
 
 ---
 
@@ -14,82 +21,112 @@
 ```
 Observation (images + language)
         │
-   [GR00T N1 VLM]  ← frozen during RL phase
+   [SmolVLA VLM]  ← frozen (SmolVLM-2, 960 hidden, 32 layers)
         │
-   internal hidden states (e.g., last 4 layers)
+   hidden states from last N layers
         │
-   [RLT Encoder] ──bottleneck──► rl_token (d=256)
-        │                              │
-   [RLT Decoder]              [Actor MLP]   [Critic MLP]
-   (reconstruction loss)      ↑                 ↑
-                         vla_action         rl_token
-                              │
-                         delta_action  ← small learned edit
-                              │
-                    final_action = vla_action + delta_action
+   [RLT Encoder] ──bottleneck──► rl_token (d=128)
+                                       │
+                              [Actor MLP] ← vla_action_chunk
+                                       │
+                              delta_action  (tanh-bounded)
+                                       │
+                     final = vla_action + delta
 ```
 
 ### Key Components
 
-- **`groot_rlt/models/rlt_encoder.py`**: Encoder-decoder transformer. Compresses GR00T's VLM hidden states through an information bottleneck into a single `rl_token` vector. The decoder reconstructs VLM embeddings from this token (bottleneck pre-training loss).
-- **`groot_rlt/models/actor.py`**: MLP actor. Takes `[rl_token, vla_action_chunk]` → `delta_action`. Edits rather than replaces VLA output.
-- **`groot_rlt/models/critic.py`**: Twin-Q critic for SAC. Takes `[rl_token, action_chunk]` → Q-value.
-- **`groot_rlt/models/groot_wrapper.py`**: Hooks into GR00T N1 to expose internal VLM hidden states alongside predicted actions.
-- **`groot_rlt/training/sac.py`**: SAC with action chunking, reference regularization (KL penalty toward VLA action), reference-action dropout.
-- **`groot_rlt/training/replay_buffer.py`**: Off-policy replay buffer storing `(rl_token, vla_action, delta, reward, next_rl_token, done)`.
-- **`groot_rlt/training/trainer.py`**: Main training loop. Pre-trains encoder-decoder offline, then runs online SAC.
+| File | Purpose |
+|------|--------|
+| `rlt/models/vla_backend.py` | Abstract `VLABackend` interface — swap VLAs by implementing this |
+| `rlt/models/smolvla_wrapper.py` | SmolVLA with PyTorch hooks on VLM layers; `MockVLAWrapper` for tests |
+| `rlt/models/rlt_encoder.py` | Encoder-decoder bottleneck transformer |
+| `rlt/models/actor.py` | SAC actor: `[rl_token, vla_action]` → tanh delta |
+| `rlt/models/critic.py` | Twin-Q SAC critic |
+| `rlt/training/sac.py` | SAC with reference regularization + MPS cache management |
+| `rlt/training/trainer.py` | Two-phase trainer (offline pretraining + online SAC) |
+| `rlt/training/replay_buffer.py` | Circular buffer with human demo injection |
+| `rlt/envs/robot_env.py` | `SO101Env` (real hardware) + `MockRobotEnv` (testing) |
+| `rlt/utils/device.py` | Device detection: auto-selects cuda > mps > cpu |
 
 ### Training Phases
 
 1. **Phase 1 — Offline Bottleneck Pre-training** (`scripts/pretrain_rlt.py`):  
-   Collect demonstrations, extract GR00T hidden states, train encoder-decoder with reconstruction loss. Encoder weights are frozen after this.
+   Load LeRobot demos → extract SmolVLA hidden states → train encoder-decoder (MSE reconstruction). Freeze encoder after.
 
-2. **Phase 2 — Online RL Fine-tuning** (`scripts/train.py`):  
-   Run SAC on the robot. Only actor and critic are updated. GR00T and encoder stay frozen.
-
-### Key Design Choices (from Pi paper)
-
-- **Action chunking**: Actor predicts a chunk of T actions, matching GR00T's temporal structure.
-- **Reference regularization**: SAC objective includes a KL/L2 penalty keeping actor close to VLA reference action. Prevents catastrophic forgetting of base policy.
-- **Reference-action dropout**: During early training, randomly drop the VLA reference action fed to actor. Forces actor to learn independent policy pathway.
-- **Human intervention integration**: Replay buffer can accept human-corrected trajectories as high-reward demonstrations.
+2. **Phase 2 — Online SAC** (`scripts/train.py`):  
+   Run SAC on SO-101. Only actor + critic update. SmolVLA + encoder frozen.
 
 ---
 
 ## Repo Structure
 
 ```
-groot-rlt/
-├── CLAUDE.md                     ← you are here
+vla-rlt/
+├── CLAUDE.md
 ├── README.md
 ├── pyproject.toml
-├── groot_rlt/
+├── setup.py
+├── rlt/                          ← main package (VLA-agnostic)
 │   ├── models/
-│   │   ├── rlt_encoder.py        # Encoder-decoder bottleneck transformer
-│   │   ├── actor.py              # SAC actor (action editing MLP)
-│   │   ├── critic.py             # Twin-Q SAC critic
-│   │   └── groot_wrapper.py      # GR00T N1 with hidden state hooks
+│   │   ├── vla_backend.py        # Abstract VLA interface
+│   │   ├── smolvla_wrapper.py    # SmolVLA + MockVLAWrapper
+│   │   ├── rlt_encoder.py        # Bottleneck encoder-decoder
+│   │   ├── actor.py              # SAC actor (action-editing MLP)
+│   │   └── critic.py             # Twin-Q critic
 │   ├── training/
-│   │   ├── sac.py                # SAC algorithm implementation
-│   │   ├── replay_buffer.py      # Off-policy replay buffer
-│   │   └── trainer.py            # Orchestrates pre-training + RL loop
+│   │   ├── sac.py                # MPS-aware SAC
+│   │   ├── replay_buffer.py      # Off-policy buffer
+│   │   └── trainer.py            # Two-phase training orchestrator
 │   ├── envs/
-│   │   └── robot_env.py          # Gym-compatible robot environment wrapper
+│   │   └── robot_env.py          # SO101Env + MockRobotEnv + DemoDataset
 │   └── utils/
-│       ├── logging.py            # WandB + console logging
-│       └── checkpointing.py      # Save/load model states
+│       ├── device.py             # cuda > mps > cpu auto-detection
+│       ├── logging.py            # WandB + console
+│       └── checkpointing.py      # Save/load with rotation
 ├── configs/
-│   ├── default.yaml              # Base hyperparameters
+│   ├── default.yaml              # Tuned for M2 Air 8GB + SmolVLA + SO-101
 │   └── tasks/
+│       ├── so101_pick_place.yaml
 │       ├── ethernet_insertion.yaml
 │       └── screwdriver_alignment.yaml
 ├── scripts/
-│   ├── pretrain_rlt.py           # Phase 1: offline bottleneck pre-training
-│   ├── train.py                  # Phase 2: online SAC
-│   └── evaluate.py               # Evaluate trained policy
+│   ├── pretrain_rlt.py
+│   ├── train.py
+│   └── evaluate.py
 └── tests/
     ├── test_models.py
     └── test_training.py
+```
+
+The old `groot_rlt/` directory has been removed.
+
+---
+
+## Environment Setup
+
+**Always use `uv` for dependency management.** Never use `pip` directly.
+
+```bash
+# Install uv
+curl -Ls https://astral.sh/uv/install.sh | sh
+
+# Clone and install
+git clone https://github.com/akashspacesky/vla-rlt
+cd vla-rlt
+uv venv .venv --python 3.10
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# For real SO-101 work (installs LeRobot):
+uv pip install -e ".[dev,robot]"
+# or: uv pip install lerobot
+```
+
+### Adding / removing dependencies
+```bash
+# Edit pyproject.toml, then:
+uv pip install -e ".[dev]"
 ```
 
 ---
@@ -99,84 +136,72 @@ groot-rlt/
 ### Running Experiments
 
 ```bash
-# Phase 1: pre-train the RLT encoder-decoder on offline demos
-python scripts/pretrain_rlt.py --config configs/default.yaml --data_dir /path/to/demos
+# Validate shapes — no hardware, no SmolVLA weights needed:
+python scripts/pretrain_rlt.py --dry_run
 
-# Phase 2: online RL on robot
-python scripts/train.py --config configs/tasks/ethernet_insertion.yaml --checkpoint rlt_pretrained.pt
+# Run tests (MPS auto-detected):
+pytest tests/ -v
 
-# Evaluate
-python scripts/evaluate.py --checkpoint runs/exp_name/best.pt --num_episodes 50
+# Phase 1: pre-train on demos
+python scripts/pretrain_rlt.py \
+    --config configs/default.yaml \
+    --data_dir /path/to/lerobot_demos
+
+# Phase 2: online SAC (mock, no robot):
+python scripts/train.py --mock
+
+# Phase 2: real SO-101:
+python scripts/train.py \
+    --config configs/tasks/so101_pick_place.yaml \
+    --encoder_ckpt checkpoints/bottleneck_pretrained.pt
 ```
 
-### Key Hyperparameters (configs/default.yaml)
+### Key Hyperparameters (M2 Air tuned)
 
-- `rlt_dim: 256` — RL token dimensionality. Smaller = more bottleneck pressure.
-- `chunk_size: 16` — Action chunk length, must match GR00T's.
-- `ref_reg_weight: 0.1` — KL penalty weight toward VLA reference action.
-- `ref_dropout_prob: 0.3` — Probability of dropping VLA reference during actor forward pass.
-- `sac_alpha: 0.2` — SAC entropy temperature.
-- `updates_per_step: 200` — How many gradient steps per environment step (key for fast on-robot training).
+- `rlt_dim: 128` — Smaller than GR00T version; 8GB constraint
+- `batch_size: 16` — MPS-safe
+- `updates_per_step: 50` — Reduced from 200; MPS is slower than CUDA
+- `action_scale: 0.1` — Max delta per step
+- `ref_reg_weight: 0.1` — L2 penalty toward VLA action
+- `device: auto` — Picks cuda > mps > cpu automatically
 
-### What to Iterate On Next
+### M2 Air 8GB Constraints
 
-- **Reward shaping**: Current impl uses sparse reward (success/failure). Dense rewards (e.g., distance to goal, force feedback) will help.
-- **RLT token dimensionality**: Try 64, 128, 256, 512 and ablate.
-- **Which layers to hook**: Default is last 4 VLM layers. Try hooking DiT action head layers too.
-- **Multi-task RLT**: Single encoder shared across tasks, task-conditioned actor.
-- **Real2Sim2Real**: Pre-train RLT in sim (Isaac Lab), transfer to real robot.
-- **Hierarchical RLT**: High-level VLA token for task planning, low-level RLT for precision.
+- Keep `batch_size ≤ 32` during SAC updates
+- Keep `pretrain_batch_size ≤ 16` during Phase 1
+- Call `empty_cache("mps")` periodically (done automatically in SAC)
+- SmolVLA inference: ~1.2GB, encoder+actor+critic: ~200MB, buffer: configurable
+
+### Adding a New VLA Backend
+
+1. Subclass `VLABackend` in `rlt/models/`
+2. Implement `forward()`, `get_hidden_dim()`, `get_chunk_size()`, `get_action_dim()`
+3. Add loading logic (analogous to `load_smolvla()`)
+4. Update `configs/default.yaml` `vla.backend` field
 
 ### Adding a New Task
 
-1. Add a task config in `configs/tasks/<task_name>.yaml` with reward function path.
-2. Implement the reward function in `groot_rlt/envs/robot_env.py` or a task-specific file.
-3. Register the embodiment in GR00T's config if using a new robot.
+1. Add `configs/tasks/<task>.yaml` with reward mode
+2. Implement `_compute_reward()` override in `rlt/envs/robot_env.py`
+3. Subclass `RobotEnv` for task-specific success detection
 
----
+### What to Iterate On Next
 
-## Environment Setup
-
-**Always use `uv` for dependency management.** Never use `pip` directly.
-
-```bash
-# Install uv (if not already installed)
-curl -Ls https://astral.sh/uv/install.sh | sh
-
-# Clone GR00T N1
-git clone https://github.com/NVIDIA/Isaac-GR00T
-cd Isaac-GR00T && uv pip install -e . && cd ..
-
-# Install groot-rlt (dev mode)
-cd groot-rlt
-uv venv .venv --python 3.10
-source .venv/bin/activate
-uv pip install -e ".[dev]"
-```
-
-### Why uv?
-- 10-100x faster than pip
-- Deterministic installs via lockfile
-- Drop-in replacement: `uv pip install` = `pip install`, `uv venv` = `python -m venv`
-
-### Adding / removing dependencies
-```bash
-# Add a new dep to pyproject.toml, then sync:
-uv pip install -e ".[dev]"   # re-run after editing pyproject.toml
-
-# Compile a lockfile (optional but recommended for reproducibility):
-uv pip compile pyproject.toml -o requirements.lock
-```
-
-Requires: Python 3.10+, PyTorch 2.1+, CUDA 12.1+ (Linux/GPU), GR00T N1 installed.
+- **Dense rewards**: Force-torque feedback for ethernet/screwdriver tasks
+- **RLT dim ablation**: Test 64 / 128 / 256
+- **Hook DiT action head**: Currently hooks VLM only; action expert may be richer
+- **Multi-task**: Shared encoder, task-conditioned actor head
+- **Sim2Real**: Collect demos in Gazebo/MuJoCo, pre-train, deploy on SO-101
 
 ---
 
 ## Notes for Claude
 
-- GR00T N1's VLM is based on Cosmos-Reason-2B. Hidden states are accessible via `output_hidden_states=True` in the forward pass.
-- The DiT action head operates on a separate latent. For now we hook the VLM (language+vision side), not the DiT.
-- SAC is preferred over PPO here because it is off-policy and dramatically more sample-efficient for real-robot settings.
-- The actor outputs a *delta* on the action chunk, not a full replacement. This is critical — it ensures the VLA's learned behaviors are preserved and RL only refines.
-- Reference-action dropout should be annealed: start high (0.5) and decay to 0 over first 1000 steps, then back up to 0.3.
+- **Package is `rlt/`** — main Python package, VLA-agnostic
+- SmolVLM-2 hidden_size = 960 (default in `smolvla_wrapper.py`)
+- Device auto-detection in `rlt/utils/device.py`: always use `get_device(cfg.device)`
+- Actor outputs *delta* on action chunk — never replace VLA actions directly
+- MPS has no float64 support — enforce float32 everywhere
+- `updates_per_step` is the key lever for on-robot sample efficiency
 - **Always use `uv` for deps.** Never suggest `pip` commands.
+- LeRobot is an optional dep (`[robot]` extra) — tests run without it via `MockVLAWrapper`
