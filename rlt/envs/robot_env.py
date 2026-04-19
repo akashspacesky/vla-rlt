@@ -1,0 +1,322 @@
+"""
+Robot environments for RLT training.
+
+SO101Env: Concrete env for the SO-101 arm via LeRobot's SOFollower interface.
+
+Observation format (SmolVLA-compatible):
+    {
+        "observation.images.<cam>": [1, C, H, W]  float32 in [0, 1]
+        "observation.state":        [1, state_dim] float32
+        "task":                     ["pick up the red block"]
+    }
+
+SO-101 motor order (matches action_dim=6):
+    [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper]
+
+Action sent to hardware:
+    {"shoulder_pan.pos": v0, "shoulder_lift.pos": v1, ..., "gripper.pos": v5}
+    (SOFollower.send_action strips the ".pos" suffix internally)
+"""
+
+import numpy as np
+import torch
+from abc import ABC, abstractmethod
+from pathlib import Path
+from torch.utils.data import Dataset
+
+
+# SO-101 motor names in canonical order (matches 6-DoF action_dim)
+SO101_MOTORS = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+]
+
+
+class RobotEnv(ABC):
+    def __init__(
+        self,
+        task_name: str,
+        chunk_size: int = 16,
+        action_dim: int = 6,          # SO-101: 6 DoF
+        max_episode_steps: int = 200,
+        reward_mode: str = "sparse",
+    ):
+        self.task_name = task_name
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        self.max_episode_steps = max_episode_steps
+        self.reward_mode = reward_mode
+        self._step_count = 0
+
+    @abstractmethod
+    def reset(self) -> dict:
+        ...
+
+    @abstractmethod
+    def _execute_action_chunk(self, action_chunk: np.ndarray) -> tuple[dict, dict]:
+        ...
+
+    def step(self, action_chunk: np.ndarray) -> tuple[dict, float, bool, dict]:
+        self._step_count += 1
+        next_obs, info = self._execute_action_chunk(action_chunk)
+        reward = self._compute_reward(next_obs, action_chunk, info)
+        done = info.get("success", False) or self._step_count >= self.max_episode_steps
+        info.update({"step": self._step_count, "success": info.get("success", False)})
+        return next_obs, reward, done, info
+
+    def _compute_reward(self, next_obs, action_chunk, info) -> float:
+        if self.reward_mode == "sparse":
+            return float(info.get("success", False))
+        elif self.reward_mode == "so101_pick_place":
+            return self._reward_pick_place(next_obs, action_chunk, info)
+        raise ValueError(f"Unknown reward_mode: {self.reward_mode}")
+
+    def _reward_pick_place(self, next_obs, action_chunk, info) -> float:
+        """
+        Dense reward for SO-101 pick-and-place.
+        Uses gripper position from robot state (index 5, normalized 0-100).
+        """
+        if info.get("success", False):
+            return 1.0
+        reward = 0.0
+        state = info.get("robot_state", np.zeros(6))
+        # Gripper: 0 = open, 100 = fully closed (MotorNormMode.RANGE_0_100)
+        gripper_norm = state[5] / 100.0 if len(state) > 5 else 0.0
+        # Reward partial grasp
+        if 0.3 < gripper_norm < 0.9:
+            reward += 0.1
+        # Penalize joint limits (joints normalized to [-100, 100] degrees)
+        joints = state[:5] / 100.0 if len(state) >= 5 else np.zeros(5)
+        joint_margin = np.minimum(joints + 1.0, 1.0 - joints).min()
+        if joint_margin < 0.1:
+            reward -= 0.05
+        return float(np.clip(reward, -0.2, 0.5))
+
+
+class SO101Env(RobotEnv):
+    """
+    Real SO-101 robot environment via LeRobot's SOFollower interface.
+
+    Connects to the SO-101 over USB serial (Feetech STS3215 motors).
+    Camera capture is handled by SOFollower's built-in camera interface.
+
+    Args:
+        task_description: Natural language task instruction for SmolVLA.
+        port: USB serial port (e.g. "/dev/tty.usbserial-FT1234", "/dev/ttyUSB0").
+        camera_name: Camera key in SOFollower's cameras dict (default "top").
+        image_size: Resize camera frames to this square size (default 224).
+        fps: Control frequency (default 30).
+        use_degrees: Use degree normalization for motors (default True).
+        robot: Pre-instantiated SOFollower (optional; skips internal setup).
+    """
+
+    def __init__(
+        self,
+        task_description: str = "pick up the object and place it in the target",
+        port: str = "/dev/ttyUSB0",
+        camera_name: str = "top",
+        image_size: int = 224,
+        fps: int = 30,
+        use_degrees: bool = True,
+        robot=None,
+        **kwargs,
+    ):
+        super().__init__(task_name="so101", action_dim=6, **kwargs)
+        self.task_description = task_description
+        self.port = port
+        self.camera_name = camera_name
+        self.image_size = image_size
+        self.fps = fps
+        self.use_degrees = use_degrees
+        self._robot = robot
+
+    def _init_hardware(self):
+        try:
+            from lerobot.robots.so_follower.so_follower import SOFollower
+            from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
+            from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+        except ImportError:
+            raise ImportError(
+                "LeRobot not installed. Run:\n"
+                "  git clone https://github.com/huggingface/lerobot\n"
+                "  uv pip install -e 'lerobot/[smolvla]'"
+            )
+
+        cameras = {
+            self.camera_name: OpenCVCameraConfig(
+                index=0,
+                fps=self.fps,
+                width=self.image_size,
+                height=self.image_size,
+            )
+        }
+        config = SOFollowerRobotConfig(
+            port=self.port,
+            cameras=cameras,
+            use_degrees=self.use_degrees,
+        )
+        print(f"[SO101Env] Connecting on {self.port} ...")
+        self._robot = SOFollower(config)
+        self._robot.connect(calibrate=False)
+        print("[SO101Env] Connected.")
+
+    def reset(self) -> dict:
+        if self._robot is None:
+            self._init_hardware()
+        self._step_count = 0
+        # No hardware reset on SO-101 — just read current state
+        return self._get_obs()
+
+    def _execute_action_chunk(self, action_chunk: np.ndarray) -> tuple[dict, dict]:
+        """
+        Execute the first action of the chunk on the robot.
+
+        action_chunk: [chunk_size, action_dim] float ndarray.
+        Motor values are expected in the robot's native units
+        (degrees if use_degrees=True, else [-100, 100]).
+        """
+        action_vec = action_chunk[0]  # take first step of chunk
+        action_dict = {
+            f"{motor}.pos": float(action_vec[i])
+            for i, motor in enumerate(SO101_MOTORS)
+        }
+        self._robot.send_action(action_dict)
+        next_obs = self._get_obs()
+        robot_state = self._obs_to_state_array(self._robot.get_observation())
+        success = self._check_success(robot_state)
+        return next_obs, {"success": success, "robot_state": robot_state}
+
+    def _get_obs(self) -> dict:
+        """
+        Read robot observation and format for SmolVLA:
+        - Images: [1, C, H, W] float32 in [0, 1]
+        - State:  [1, 6] float32
+        - Task:   list[str]
+        """
+        raw = self._robot.get_observation()
+        state = torch.tensor(
+            self._obs_to_state_array(raw), dtype=torch.float32
+        ).unsqueeze(0)  # [1, 6]
+
+        # Camera frame: numpy [H, W, C] uint8 -> [1, C, H, W] float32
+        frame = raw.get(self.camera_name)
+        if frame is None:
+            raise KeyError(
+                f"Camera '{self.camera_name}' not found in observation. "
+                f"Available keys: {list(raw.keys())}"
+            )
+        img = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0  # [C, H, W]
+        if img.shape[1] != self.image_size or img.shape[2] != self.image_size:
+            import torch.nn.functional as F
+            img = F.interpolate(
+                img.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+        return {
+            f"observation.images.{self.camera_name}": img.unsqueeze(0),  # [1,C,H,W]
+            "observation.state": state,                                    # [1, 6]
+            "task": [self.task_description],
+        }
+
+    def _obs_to_state_array(self, raw_obs: dict) -> np.ndarray:
+        """Extract joint positions from get_observation() dict -> [6] float32."""
+        return np.array(
+            [raw_obs.get(f"{m}.pos", 0.0) for m in SO101_MOTORS],
+            dtype=np.float32,
+        )
+
+    def _check_success(self, state: np.ndarray) -> bool:
+        # Override in task subclasses with real success detection
+        return False
+
+    def close(self):
+        if self._robot is not None and self._robot.is_connected:
+            self._robot.disconnect()
+            self._robot = None
+
+
+class MockRobotEnv(RobotEnv):
+    """Mock env for testing. No hardware needed. Matches SO-101 / SmolVLA format."""
+
+    def __init__(
+        self,
+        success_prob: float = 0.1,
+        image_size: int = 224,
+        camera_name: str = "top",
+        **kwargs,
+    ):
+        super().__init__(task_name="mock", reward_mode="sparse", action_dim=6, **kwargs)
+        self.success_prob = success_prob
+        self.image_size = image_size
+        self.camera_name = camera_name
+
+    def reset(self) -> dict:
+        self._step_count = 0
+        return self._random_obs()
+
+    def _execute_action_chunk(self, action_chunk: np.ndarray) -> tuple[dict, dict]:
+        success = np.random.random() < self.success_prob
+        return self._random_obs(), {"success": success, "robot_state": np.random.randn(6)}
+
+    def _random_obs(self) -> dict:
+        return {
+            f"observation.images.{self.camera_name}": torch.rand(
+                1, 3, self.image_size, self.image_size
+            ),
+            "observation.state": torch.randn(1, 6),
+            "task": ["pick up the block"],
+        }
+
+
+class DemoDataset(Dataset):
+    """
+    Dataset for Phase 1 pre-training.
+    Loads LeRobot v2 episodes, extracts VLA hidden states, caches to disk.
+
+    Each episode file (episode_*.pt) should be a dict with:
+        {"observations": [obs_dict, ...], "actions": [...]}
+    """
+
+    def __init__(self, data_dir: str, vla, cache_dir: str | None = None, device: str = "cpu"):
+        self.data_dir = Path(data_dir)
+        self.vla = vla
+        self.cache_dir = Path(cache_dir) if cache_dir else self.data_dir / ".rlt_cache"
+        self.cache_dir.mkdir(exist_ok=True)
+        self.device = device
+
+        self.episode_paths = sorted(self.data_dir.glob("episode_*.pt"))
+        if not self.episode_paths:
+            raise FileNotFoundError(f"No episode_*.pt files in {data_dir}")
+
+        print(f"[DemoDataset] Extracting hidden states from {len(self.episode_paths)} episodes...")
+        self._extract_and_cache()
+        self.hs_files = sorted(self.cache_dir.glob("hs_*.pt"))
+        print(f"[DemoDataset] Ready. {len(self.hs_files)} cached tensors.")
+
+    def _extract_and_cache(self):
+        for ep_path in self.episode_paths:
+            cache_path = self.cache_dir / f"hs_{ep_path.stem}.pt"
+            if cache_path.exists():
+                continue
+            episode = torch.load(ep_path)
+            hs_list = []
+            for obs in episode["observations"]:
+                with torch.no_grad():
+                    out = self.vla(obs)
+                hs_list.append(out["hidden_states"].cpu())
+            torch.save(torch.stack(hs_list), cache_path)
+
+    def __len__(self) -> int:
+        return len(self.hs_files)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        hs_ep = torch.load(self.hs_files[idx])  # [T, seq*layers, d_model]
+        t = np.random.randint(0, len(hs_ep))
+        return {"hidden_states": hs_ep[t]}
