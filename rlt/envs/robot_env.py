@@ -41,7 +41,7 @@ class RobotEnv(ABC):
         self,
         task_name: str,
         chunk_size: int = 16,
-        action_dim: int = 6,          # SO-101: 6 DoF
+        action_dim: int = 6,
         max_episode_steps: int = 200,
         reward_mode: str = "sparse",
     ):
@@ -76,20 +76,13 @@ class RobotEnv(ABC):
         raise ValueError(f"Unknown reward_mode: {self.reward_mode}")
 
     def _reward_pick_place(self, next_obs, action_chunk, info) -> float:
-        """
-        Dense reward for SO-101 pick-and-place.
-        Uses gripper position from robot state (index 5, normalized 0–100).
-        """
         if info.get("success", False):
             return 1.0
         reward = 0.0
         state = info.get("robot_state", np.zeros(6))
-        # Gripper: 0 = open, 100 = fully closed (MotorNormMode.RANGE_0_100)
         gripper_norm = state[5] / 100.0 if len(state) > 5 else 0.0
-        # Reward partial grasp
         if 0.3 < gripper_norm < 0.9:
             reward += 0.1
-        # Penalize joint limits (joints normalized to [-100, 100] degrees)
         joints = state[:5] / 100.0 if len(state) >= 5 else np.zeros(5)
         joint_margin = np.minimum(joints + 1.0, 1.0 - joints).min()
         if joint_margin < 0.1:
@@ -99,87 +92,83 @@ class RobotEnv(ABC):
 
 class SO101Env(RobotEnv):
     """
-    Real SO-101 robot environment via LeRobot's SOFollower interface.
+    Real SO-101 robot environment.
 
-    Connects to the SO-101 over USB serial (Feetech STS3215 motors).
-    Camera capture is handled by SOFollower's built-in camera interface.
+    Motor control via LeRobot SOFollower; camera via cv2 directly
+    (avoids av/cv2 libavdevice dylib conflict on macOS).
 
     Args:
         task_description: Natural language task instruction for SmolVLA.
-        port: USB serial port (e.g. "/dev/tty.usbserial-FT1234", "/dev/ttyUSB0").
-        camera_name: Camera key in SOFollower's cameras dict (default "top").
-        image_size: Resize camera frames to this square size (default 224).
-        fps: Control frequency (default 30).
-        use_degrees: Use degree normalization for motors (default True).
-        robot: Pre-instantiated SOFollower (optional; skips internal setup).
+        port: USB serial port, e.g. "/dev/tty.usbmodem..."
+        camera_index: cv2 camera index (default 0).
+        camera_name: Key name used in observation dict (default "top").
+        image_size: Resize frames to this square size (default 224).
+        fps: Target control frequency (default 30).
+        use_degrees: Degree normalization for motors (default True).
+        calibrate: Run interactive calibration on connect (default False).
+        robot: Pre-instantiated SOFollower (skips internal setup).
     """
 
     def __init__(
         self,
         task_description: str = "pick up the object and place it in the target",
         port: str = "/dev/ttyUSB0",
+        camera_index: int = 0,
         camera_name: str = "top",
         image_size: int = 224,
         fps: int = 30,
         use_degrees: bool = True,
+        calibrate: bool = False,
         robot=None,
         **kwargs,
     ):
         super().__init__(task_name="so101", action_dim=6, **kwargs)
         self.task_description = task_description
         self.port = port
+        self.camera_index = camera_index
         self.camera_name = camera_name
         self.image_size = image_size
         self.fps = fps
         self.use_degrees = use_degrees
+        self.calibrate = calibrate
         self._robot = robot
+        self._cap = None
 
     def _init_hardware(self):
+        import cv2
         try:
             from lerobot.robots.so_follower.so_follower import SOFollower
             from lerobot.robots.so_follower.config_so_follower import SOFollowerRobotConfig
-            from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
         except ImportError:
             raise ImportError(
                 "LeRobot not installed. Run:\n"
-                "  git clone https://github.com/huggingface/lerobot\n"
-                "  uv pip install -e 'lerobot/[smolvla]'"
+                "  uv pip install lerobot feetech-servo-sdk"
             )
 
-        cameras = {
-            self.camera_name: OpenCVCameraConfig(
-                index_or_path=0,
-                fps=self.fps,
-                width=self.image_size,
-                height=self.image_size,
-            )
-        }
+        # Motor-only config — camera handled by cv2 to avoid av/cv2 dylib conflict
         config = SOFollowerRobotConfig(
             port=self.port,
-            cameras=cameras,
+            cameras={},
             use_degrees=self.use_degrees,
         )
-        print(f"[SO101Env] Connecting on {self.port} ...")
+        print(f"[SO101Env] Connecting motors on {self.port} ...")
         self._robot = SOFollower(config)
-        self._robot.connect(calibrate=False)
+        self._robot.connect(calibrate=self.calibrate)
+
+        print(f"[SO101Env] Opening camera {self.camera_index} ...")
+        self._cap = cv2.VideoCapture(self.camera_index)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"Could not open camera {self.camera_index}")
         print("[SO101Env] Connected.")
 
     def reset(self) -> dict:
         if self._robot is None:
             self._init_hardware()
         self._step_count = 0
-        # No hardware reset on SO-101 — just read current state
         return self._get_obs()
 
     def _execute_action_chunk(self, action_chunk: np.ndarray) -> tuple[dict, dict]:
-        """
-        Execute the first action of the chunk on the robot.
-
-        action_chunk: [chunk_size, action_dim] float ndarray.
-        Motor values are expected in the robot's native units
-        (degrees if use_degrees=True, else [-100, 100]).
-        """
-        action_vec = action_chunk[0]  # take first step of chunk
+        action_vec = action_chunk[0]
         action_dict = {
             f"{motor}.pos": float(action_vec[i])
             for i, motor in enumerate(SO101_MOTORS)
@@ -191,27 +180,21 @@ class SO101Env(RobotEnv):
         return next_obs, {"success": success, "robot_state": robot_state}
 
     def _get_obs(self) -> dict:
-        """
-        Read robot observation and format for SmolVLA:
-        - Images: [1, C, H, W] float32 in [0, 1]
-        - State:  [1, 6] float32
-        - Task:   list[str]
-        """
+        import cv2
+        import torch.nn.functional as F
+
         raw = self._robot.get_observation()
         state = torch.tensor(
             self._obs_to_state_array(raw), dtype=torch.float32
         ).unsqueeze(0)  # [1, 6]
 
-        # Camera frame: numpy [H, W, C] uint8 → [1, C, H, W] float32
-        frame = raw.get(self.camera_name)
-        if frame is None:
-            raise KeyError(
-                f"Camera '{self.camera_name}' not found in observation. "
-                f"Available keys: {list(raw.keys())}"
-            )
+        # Camera via cv2 (avoids av/cv2 dylib conflict in lerobot camera thread)
+        ret, frame = self._cap.read()
+        if not ret:
+            raise RuntimeError("cv2 camera read failed")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0  # [C, H, W]
         if img.shape[1] != self.image_size or img.shape[2] != self.image_size:
-            import torch.nn.functional as F
             img = F.interpolate(
                 img.unsqueeze(0),
                 size=(self.image_size, self.image_size),
@@ -226,17 +209,18 @@ class SO101Env(RobotEnv):
         }
 
     def _obs_to_state_array(self, raw_obs: dict) -> np.ndarray:
-        """Extract joint positions from get_observation() dict → [6] float32."""
         return np.array(
             [raw_obs.get(f"{m}.pos", 0.0) for m in SO101_MOTORS],
             dtype=np.float32,
         )
 
     def _check_success(self, state: np.ndarray) -> bool:
-        # Override in task subclasses with real success detection
         return False
 
     def close(self):
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
         if self._robot is not None and self._robot.is_connected:
             self._robot.disconnect()
             self._robot = None
@@ -278,9 +262,7 @@ class MockRobotEnv(RobotEnv):
 class DemoDataset(Dataset):
     """
     Dataset for Phase 1 pre-training.
-    Loads LeRobot v2 episodes, extracts VLA hidden states, caches to disk.
-
-    Each episode file (episode_*.pt) should be a dict with:
+    Each episode file (episode_*.pt) should be a dict:
         {"observations": [obs_dict, ...], "actions": [...]}
     """
 
@@ -317,6 +299,6 @@ class DemoDataset(Dataset):
         return len(self.hs_files)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        hs_ep = torch.load(self.hs_files[idx])  # [T, seq*layers, d_model]
+        hs_ep = torch.load(self.hs_files[idx])
         t = np.random.randint(0, len(hs_ep))
         return {"hidden_states": hs_ep[t]}

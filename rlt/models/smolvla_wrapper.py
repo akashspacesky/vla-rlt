@@ -31,10 +31,10 @@ from rlt.models.vla_backend import VLABackend
 # SmolVLM-2 256M config (backbone of SmolVLA)
 SMOLVLM_HIDDEN_SIZE = 960
 SMOLVLM_NUM_LAYERS = 32
-SMOLVLA_CHUNK_SIZE = 16     # Default action chunk, configurable
+SMOLVLA_CHUNK_SIZE = 16
 SMOLVLA_ACTION_DIM = 6      # SO-101: 6 DoF (5 joints + gripper)
 
-# LeRobot constants (copied to avoid import when lerobot not installed)
+# LeRobot constants
 OBS_STATE = "observation.state"
 OBS_LANGUAGE_TOKENS = "observation.language.tokens"
 OBS_LANGUAGE_ATTENTION_MASK = "observation.language.attention_mask"
@@ -51,7 +51,6 @@ class HiddenStateCapture:
         self._hooks.append(module.register_forward_hook(self._hook_fn))
 
     def _hook_fn(self, module, input, output):
-        # output may be a tuple (some MLP variants) or a plain tensor
         h = output[0] if isinstance(output, tuple) else output
         self.states.append(h.detach())
 
@@ -71,10 +70,6 @@ class SmolVLAWrapper(VLABackend):
     Hooks the MLP sub-module of the last `num_hook_layers` VLM transformer
     layers. The MLP is called via layer.mlp(hidden_states) during the
     SmolVLMWithExpertModel forward pass, so hooks fire correctly.
-
-    The captured hidden states come from the prefix pass (images + language
-    + state tokens), giving a rich contextual representation for the RLT
-    encoder.
 
     Args:
         policy: Instantiated SmolVLAPolicy (from lerobot)
@@ -149,24 +144,32 @@ class SmolVLAWrapper(VLABackend):
         """
         Convert raw obs dict into the batch format SmolVLAPolicy expects.
 
-        Input obs keys:
-            "observation.images.<cam>": [B, C, H, W] float32 in [0, 1]
-            "observation.state":        [B, state_dim]
-            "task":                     list of str
-
-        Output batch adds:
-            OBS_LANGUAGE_TOKENS:        [B, seq_len]  long
-            OBS_LANGUAGE_ATTENTION_MASK:[B, seq_len]  long
-        Images and state are moved to device but not otherwise transformed
-        (SmolVLAPolicy.prepare_images / prepare_state handle that internally).
+        Auto-remaps obs image keys to the checkpoint's expected camera keys
+        and resizes to the checkpoint's required resolution. This lets a
+        single-camera env work against multi-camera base checkpoints.
         """
-        batch = {}
+        import torch.nn.functional as F
 
+        batch = {}
         for k, v in obs.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(self.device, dtype=torch.float32)
             else:
                 batch[k] = v
+
+        # Remap obs image keys to whatever keys the loaded checkpoint expects,
+        # resizing to the checkpoint's required resolution.
+        expected_img_features = dict(self.policy.config.image_features)
+        obs_img_keys = [k for k in obs if k.startswith("observation.images.")]
+        if obs_img_keys and expected_img_features:
+            src_imgs = [batch[k] for k in obs_img_keys if k in batch]
+            for i, (exp_key, feat) in enumerate(expected_img_features.items()):
+                if exp_key not in batch:
+                    img = src_imgs[i % len(src_imgs)]
+                    tgt_h, tgt_w = feat.shape[1], feat.shape[2]
+                    if img.shape[-2] != tgt_h or img.shape[-1] != tgt_w:
+                        img = F.interpolate(img, size=(tgt_h, tgt_w), mode="bilinear", align_corners=False)
+                    batch[exp_key] = img
 
         # Tokenize task language
         if "task" in obs:
@@ -199,17 +202,9 @@ class SmolVLAWrapper(VLABackend):
                 "action_chunk":  [B, chunk_size, action_dim]
                 "hidden_states": [B, seq_len * num_hook_layers, d_model]
             }
-
-        Hidden states are from the last num_hook_layers VLM transformer
-        layers (specifically their MLP outputs), concatenated along the
-        sequence dimension.
         """
         self.capture.clear()
-
         batch = self._build_batch(obs)
-
-        # predict_action_chunk always runs the full VLM forward (no queue),
-        # so hooks fire on every call. Returns [B, chunk_size, action_dim].
         action_chunk = self.policy.predict_action_chunk(batch)
 
         if not self.capture.states:
@@ -220,12 +215,10 @@ class SmolVLAWrapper(VLABackend):
                 "Run: print([n for n, _ in policy.named_modules()])"
             )
 
-        # Concatenate along sequence dim: [B, seq*num_layers, d_model]
         hidden_states = torch.cat(self.capture.states, dim=1)
-
         return {
-            "action_chunk": action_chunk,       # [B, chunk_size, action_dim]
-            "hidden_states": hidden_states,      # [B, seq*layers, d_model]
+            "action_chunk": action_chunk,
+            "hidden_states": hidden_states,
         }
 
     def get_hidden_dim(self) -> int:
@@ -264,7 +257,7 @@ def load_smolvla(
             "  uv pip install -e 'lerobot/[smolvla]'"
         )
 
-    print(f"[SmolVLA] Loading {model_id} → {device} ...")
+    print(f"[SmolVLA] Loading {model_id} \u2192 {device} ...")
     policy = SmolVLAPolicy.from_pretrained(model_id)
     policy.eval()
 
@@ -282,13 +275,12 @@ class MockVLAWrapper(VLABackend):
     """
     Mock VLA backend for unit testing and dry-runs.
     No model weights needed. Produces correctly-shaped random tensors.
-    Defaults match SmolVLA / SO-101 specs.
     """
 
     def __init__(
         self,
         d_model: int = SMOLVLM_HIDDEN_SIZE,
-        seq_len: int = 64,               # SmolVLA: 64 visual tokens per layer
+        seq_len: int = 64,
         num_hook_layers: int = 4,
         chunk_size: int = SMOLVLA_CHUNK_SIZE,
         action_dim: int = SMOLVLA_ACTION_DIM,
@@ -301,7 +293,6 @@ class MockVLAWrapper(VLABackend):
         self._chunk_size = chunk_size
         self._action_dim = action_dim
         self.device = device
-        # Dummy param so .to(device) and .parameters() work
         self._dummy = nn.Linear(1, 1)
 
     @torch.no_grad()
@@ -311,14 +302,11 @@ class MockVLAWrapper(VLABackend):
             if isinstance(v, torch.Tensor) and v.ndim >= 1:
                 batch = v.shape[0]
                 break
-
         hidden_states = torch.randn(
-            batch, self.seq_len * self.num_hook_layers, self.d_model,
-            device=self.device,
+            batch, self.seq_len * self.num_hook_layers, self.d_model, device=self.device
         )
         action_chunk = torch.randn(
-            batch, self._chunk_size, self._action_dim,
-            device=self.device,
+            batch, self._chunk_size, self._action_dim, device=self.device
         )
         return {"action_chunk": action_chunk, "hidden_states": hidden_states}
 
