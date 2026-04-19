@@ -1,19 +1,21 @@
 """
-SmolVLA inference smoke test on real SO-101.
+SmolVLA inference + smooth execution test on real SO-101.
 
 Loads SmolVLA, connects SO-101 + USB cam, runs N inference steps.
-Prints action chunks — does NOT move the robot unless --execute is passed.
+With --execute, interpolates smoothly from current joint state to the
+SmolVLA target to avoid sudden jumps.
 
 Usage:
-    # Observe only (safe):
+    # Observe only (safe — no movement):
     python3 scripts/test_smolvla_robot.py --port /dev/tty.usbmodem5A680100951
 
-    # Actually move the robot (ensure workspace is clear):
-    python3 scripts/test_smolvla_robot.py --port /dev/tty.usbmodem5A680100951 --execute
-
-    # Custom task / more steps:
+    # Smooth execution, 20 interpolation steps per action:
     python3 scripts/test_smolvla_robot.py --port /dev/tty.usbmodem5A680100951 \\
-        --task "pick up the red block" --steps 10
+        --execute --smooth-steps 20 --step-delay 0.05
+
+    # Custom task:
+    python3 scripts/test_smolvla_robot.py --port /dev/tty.usbmodem5A680100951 \\
+        --execute --task "pick up the red block" --steps 10
 """
 
 import argparse
@@ -30,14 +32,42 @@ def parse_args():
     p.add_argument("--port", required=True, help="SO-101 USB port, e.g. /dev/tty.usbmodem...")
     p.add_argument("--cam", type=int, default=0, help="USB camera index")
     p.add_argument("--task", default="pick up the object and place it in the target")
-    p.add_argument("--steps", type=int, default=5)
+    p.add_argument("--steps", type=int, default=5, help="Number of VLA inference steps")
     p.add_argument("--model", default="lerobot/smolvla_base")
     p.add_argument("--device", default="auto")
     p.add_argument(
         "--execute", action="store_true",
         help="Send actions to the robot. It WILL MOVE — ensure workspace is clear.",
     )
+    p.add_argument(
+        "--smooth-steps", type=int, default=20,
+        help="Interpolation steps between current and target position (default 20).",
+    )
+    p.add_argument(
+        "--step-delay", type=float, default=0.05,
+        help="Seconds between interpolation steps (default 0.05 = 20 Hz).",
+    )
+    p.add_argument(
+        "--calibrate", action="store_true",
+        help="Run interactive motor calibration (needed once per robot setup).",
+    )
     return p.parse_args()
+
+
+def smooth_move(robot, current_deg: np.ndarray, target_deg: np.ndarray,
+                n_steps: int, step_delay: float):
+    """
+    Linearly interpolate from current to target joint positions,
+    sending each waypoint to the robot with a small delay.
+
+    current_deg / target_deg: [6] float arrays in degrees.
+    """
+    for i in range(1, n_steps + 1):
+        alpha = i / n_steps
+        waypoint = current_deg + alpha * (target_deg - current_deg)
+        action_dict = {f"{m}.pos": float(waypoint[j]) for j, m in enumerate(SO101_MOTORS)}
+        robot._robot.send_action(action_dict)
+        time.sleep(step_delay)
 
 
 def main():
@@ -45,22 +75,24 @@ def main():
     device = get_device(args.device)
     print(f"[*] Device: {device}")
 
-    # Load SmolVLA
     print(f"[*] Loading SmolVLA ({args.model}) ...")
     vla = load_smolvla(model_id=args.model, device=device)
     print(f"[*] SmolVLA ready. hidden_dim={vla.get_hidden_dim()}, chunk={vla.get_chunk_size()}")
 
-    # Connect SO-101 + camera
     env = SO101Env(
         task_description=args.task,
         port=args.port,
         camera_name="top",
         image_size=224,
         fps=30,
+        calibrate=args.calibrate,
     )
 
     if args.execute:
-        print("\n  *** --execute ON — robot WILL MOVE. Ctrl+C to abort. Pausing 3s... ***\n")
+        total_s = args.smooth_steps * args.step_delay
+        print(f"\n  *** --execute ON — smooth motion: {args.smooth_steps} steps × "
+              f"{args.step_delay}s = {total_s:.1f}s per action ***")
+        print("  Ctrl+C to abort at any time. Pausing 3s...\n")
         time.sleep(3)
 
     try:
@@ -75,23 +107,22 @@ def main():
 
             action_chunk = out["action_chunk"]   # [1, chunk, 6]
             hidden = out["hidden_states"]         # [1, seq*layers, d_model]
-            first = action_chunk[0, 0].cpu().numpy()
+            target = action_chunk[0, 0].cpu().numpy()   # first step of chunk [6]
+            current = obs["observation.state"][0].cpu().numpy()  # current joints [6]
 
-            state = obs["observation.state"][0].cpu().numpy()
             print(f"[step {step}/{args.steps}]  inference: {elapsed_ms:.0f}ms")
-            print(f"  state (deg)        : {np.array2string(state, precision=1, suppress_small=True)}")
-            print(f"  action_chunk shape : {tuple(action_chunk.shape)}")
-            print(f"  hidden_states shape: {tuple(hidden.shape)}")
-            print(f"  first action (deg) : {np.array2string(first, precision=2, suppress_small=True)}")
+            print(f"  current (deg) : {np.array2string(current, precision=1, suppress_small=True)}")
+            print(f"  target  (deg) : {np.array2string(target,  precision=1, suppress_small=True)}")
+            print(f"  delta   (deg) : {np.array2string(target - current, precision=1, suppress_small=True)}")
+            print(f"  hidden_states : {tuple(hidden.shape)}")
 
             if args.execute:
-                obs, reward, done, info = env.step(action_chunk[0].cpu().numpy())
-                print(f"  [SENT] reward={reward:.3f}  done={done}")
-                if done:
-                    print("[*] Episode done — resetting.")
-                    obs = env.reset()
+                print(f"  [MOVING] interpolating over {args.smooth_steps} steps "
+                      f"({args.smooth_steps * args.step_delay:.1f}s) ...")
+                smooth_move(env, current, target, args.smooth_steps, args.step_delay)
+                obs = env.reset()   # read fresh obs after motion completes
+                print(f"  [DONE]")
             else:
-                # Refresh obs without executing
                 obs = env.reset()
 
             print()
