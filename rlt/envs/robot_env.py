@@ -78,7 +78,7 @@ class RobotEnv(ABC):
     def _reward_pick_place(self, next_obs, action_chunk, info) -> float:
         """
         Dense reward for SO-101 pick-and-place.
-        Uses gripper position from robot state (index 5, normalized 0-100).
+        Uses gripper position from robot state (index 5, normalized 0–100).
         """
         if info.get("success", False):
             return 1.0
@@ -148,7 +148,7 @@ class SO101Env(RobotEnv):
 
         cameras = {
             self.camera_name: OpenCVCameraConfig(
-                index=0,
+                index_or_path=0,
                 fps=self.fps,
                 width=self.image_size,
                 height=self.image_size,
@@ -202,7 +202,7 @@ class SO101Env(RobotEnv):
             self._obs_to_state_array(raw), dtype=torch.float32
         ).unsqueeze(0)  # [1, 6]
 
-        # Camera frame: numpy [H, W, C] uint8 -> [1, C, H, W] float32
+        # Camera frame: numpy [H, W, C] uint8 → [1, C, H, W] float32
         frame = raw.get(self.camera_name)
         if frame is None:
             raise KeyError(
@@ -226,7 +226,7 @@ class SO101Env(RobotEnv):
         }
 
     def _obs_to_state_array(self, raw_obs: dict) -> np.ndarray:
-        """Extract joint positions from get_observation() dict -> [6] float32."""
+        """Extract joint positions from get_observation() dict → [6] float32."""
         return np.array(
             [raw_obs.get(f"{m}.pos", 0.0) for m in SO101_MOTORS],
             dtype=np.float32,
